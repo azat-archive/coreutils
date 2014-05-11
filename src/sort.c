@@ -853,22 +853,36 @@ create_temp_file (int *pfd, bool survive_fd_exhaustion)
   static size_t temp_dir_index;
   int fd;
   int saved_errno;
-  char const *temp_dir = temp_dirs[temp_dir_index];
-  size_t len = strlen (temp_dir);
-  struct tempnode *node =
-    xmalloc (offsetof (struct tempnode, name) + len + sizeof slashbase);
-  char *file = node->name;
+  char const *temp_dir;
+  size_t len;
+  struct tempnode *node = NULL;
+  char *file;
   struct cs_status cs;
-
-  memcpy (file, temp_dir, len);
-  memcpy (file + len, slashbase, sizeof slashbase);
-  node->next = NULL;
-  if (++temp_dir_index == temp_dir_count)
-    temp_dir_index = 0;
+  size_t start_dir_index = temp_dir_index;
 
   /* Create the temporary file in a critical section, to avoid races.  */
   cs = cs_enter ();
-  fd = mkstemp (file);
+  do
+    {
+      temp_dir = temp_dirs[temp_dir_index];
+      len = strlen (temp_dir);
+      node =
+        xrealloc (node,
+                  offsetof (struct tempnode, name) + len + sizeof slashbase);
+      file = node->name;
+      memcpy (file, temp_dir, len);
+      memcpy (file + len, slashbase, sizeof slashbase);
+      node->next = NULL;
+
+      if (++temp_dir_index == temp_dir_count)
+        temp_dir_index = 0;
+
+      fd = mkstemp (file);
+
+      if (errno != ENOSPC || temp_dir_index == start_dir_index)
+        break;
+    } while (0 <= fd);
+
   if (0 <= fd)
     {
       *temptail = node;
