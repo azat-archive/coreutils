@@ -1132,6 +1132,13 @@ maybe_create_temp (FILE **pfp, bool survive_fd_exhaustion)
 
           async_safe_die (errno, "couldn't execute compress program");
         }
+      else
+        {
+          error (0, errno,
+                 _("warning: couldn't create process for %s "
+                   "(try to install overcommit always)"),
+                 compress_program);
+        }
     }
 
   *pfp = fdopen (tempfd, "w");
