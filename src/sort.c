@@ -26,6 +26,7 @@
 #include <pthread.h>
 #include <sys/resource.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <assert.h>
@@ -53,6 +54,7 @@
 #include "xmemcoll.h"
 #include "xnanosleep.h"
 #include "xstrtol.h"
+#include "gnulib/lib/passfd.h"
 
 #ifndef RLIMIT_DATA
 struct rlimit { size_t rlim_cur; };
@@ -133,20 +135,6 @@ enum
     /* POSIX says any other irregular exit must exit with a status
        code greater than 1.  */
     SORT_FAILURE = 2
-  };
-
-enum
-  {
-    /* The number of times we should try to fork a compression process
-       (we retry if the fork call fails).  We don't _need_ to compress
-       temp files, this is just to reduce disk access, so this number
-       can be small.  Each retry doubles in duration.  */
-    MAX_FORK_TRIES_COMPRESS = 4,
-
-    /* The number of times we should try to fork a decompression process.
-       If we can't fork a decompression process, we can't sort, so this
-       number should be big.  Each retry doubles in duration.  */
-    MAX_FORK_TRIES_DECOMPRESS = 9
   };
 
 enum
@@ -707,6 +695,32 @@ static pid_t nprocs;
 
 static bool delete_proc (pid_t);
 
+static const char FORK_WORKER_CREATE = 'C';
+static const char FORK_WORKER_REAP = 'R';
+static const char FORK_WORKER_CLEANUP = 'E';
+/* Used for adding jobs */
+static int fork_worker_add[2];
+/* Used for testing jobs status */
+static int fork_worker_test[2];
+
+static ssize_t
+read_or_die (int fd, void *buf, size_t count, const char *msg)
+{
+  ssize_t ret = read (fd, buf, count);
+  if (ret != count)
+    error (SORT_FAILURE, errno, "fork ctrl read: %s", msg);
+  return ret;
+}
+static ssize_t
+write_or_die (int fd, const void *buf, size_t count, const char *msg)
+{
+  ssize_t ret = write (fd, buf, count);
+  if (ret != count)
+    error (SORT_FAILURE, errno, "fork ctrl write: %s", msg);
+  return ret;
+}
+
+
 /* If PID is positive, wait for the child process with that PID to
    exit, and assume that PID has already been removed from the process
    table.  If PID is 0 or -1, clean up some child that has exited (by
@@ -718,7 +732,13 @@ static pid_t
 reap (pid_t pid)
 {
   int status;
-  pid_t cpid = waitpid ((pid ? pid : -1), &status, (pid ? 0 : WNOHANG));
+  pid_t cpid;
+
+  /** TODO: syncing issues? separate socketpair? */
+  write_or_die (fork_worker_add[1], &FORK_WORKER_REAP, 1, "type");
+  write_or_die (fork_worker_add[1], &pid, sizeof(pid), "pid");
+  read_or_die (fork_worker_test[0], &cpid, sizeof(cpid), "cpid");
+  read_or_die (fork_worker_test[0], &status, sizeof(status), "status");
 
   if (cpid < 0)
     error (SORT_FAILURE, errno, _("waiting for %s [-d]"),
@@ -785,21 +805,21 @@ wait_proc (pid_t pid)
 /* Reap any exited children.  Do not block; reap only those that have
    already exited.  */
 
-static void
-reap_exited (void)
-{
-  while (0 < nprocs && reap (0))
-    continue;
-}
+//static void
+//reap_exited (void)
+//{
+//  while (0 < nprocs && reap (0))
+//    continue;
+//}
 
 /* Reap at least one exited child, waiting if necessary.  */
 
-static void
-reap_some (void)
-{
-  reap (-1);
-  reap_exited ();
-}
+//static void
+//reap_some (void)
+//{
+//  reap (-1);
+//  reap_exited ();
+//}
 
 /* Reap all children, waiting if necessary.  */
 
@@ -841,12 +861,10 @@ exit_cleanup (void)
 
 /* Create a new temporary file, returning its newly allocated tempnode.
    Store into *PFD the file descriptor open for writing.
-   If the creation fails, return NULL and store -1 into *PFD if the
-   failure is due to file descriptor exhaustion and
-   SURVIVE_FD_EXHAUSTION; otherwise, die.  */
+   If the creation fails, die.  */
 
 static struct tempnode *
-create_temp_file (int *pfd, bool survive_fd_exhaustion)
+create_temp_file (int *pfd)
 {
   static char const slashbase[] = "/sortXXXXXX";
   static size_t temp_dir_index;
@@ -879,9 +897,8 @@ create_temp_file (int *pfd, bool survive_fd_exhaustion)
 
   if (fd < 0)
     {
-      if (! (survive_fd_exhaustion && errno == EMFILE))
-        error (SORT_FAILURE, errno, _("cannot create temporary file in %s"),
-               quote (temp_dir));
+      error (SORT_FAILURE, errno, _("cannot create temporary file in %s"),
+             quote (temp_dir));
       free (node);
       node = NULL;
     }
@@ -1015,23 +1032,58 @@ move_fd_or_die (int oldfd, int newfd)
     }
 }
 
-/* Fork a child process for piping to and do common cleanup.  The
-   TRIES parameter tells us how many times to try to fork before
-   giving up.  Return the PID of the child, or -1 (setting errno)
-   on failure. */
+/* Helper process for fork a child, pre-creating it at the very beginning allow
+   sort to avoid copying all page-tables to the child process (also if you
+   overcommit doesn't installed to always fork() will fail, and there will be
+   no compression for temporary files for example). */
 
-static pid_t
-pipe_fork (int pipefds[2], size_t tries)
+static void
+fork_worker_cleanup (void)
 {
-#if HAVE_WORKING_FORK
-  struct tempnode *saved_temphead;
-  int saved_errno;
-  double wait_retry = 0.25;
-  pid_t pid IF_LINT ( = -1);
-  struct cs_status cs;
+  write_or_die (fork_worker_add[1], &FORK_WORKER_CLEANUP, 1, "cleanup");
+}
+static int
+exec_or_die (const char *command, int decompress)
+{
+  int ret;
+  if (decompress)
+    ret = execlp (command, command, "-d", NULL);
+  else
+    ret = execlp (command, command, NULL);
 
-  if (pipe (pipefds) < 0)
-    return -1;
+  if (ret != 0)
+    {
+      error (SORT_FAILURE, errno, "exec: %s", command);
+    }
+  return ret;
+}
+
+static void
+fork_worker_reap (void)
+{
+  pid_t pid;
+  pid_t cpid;
+  int status;
+
+  read_or_die (fork_worker_add[0], &pid, sizeof (pid), "pid");
+  cpid = waitpid ((pid ? pid : -1), &status, (pid ? 0 : WNOHANG));
+  write_or_die (fork_worker_test[1], &cpid, sizeof(cpid), "fail to reply");
+  write_or_die (fork_worker_test[1], &status, sizeof(status), "fail to reply");
+}
+static void
+fork_worker_create (void)
+{
+  pid_t pid;
+  int fd[2];
+  int decompress;
+
+  read_or_die (fork_worker_add[0], &decompress, sizeof (decompress), "decompress");
+
+  /* read std{in,out} fd numbers */
+  fd[0] = recvfd (fork_worker_add[0], 0);
+  fd[1] = recvfd (fork_worker_add[0], 0);
+  if (fd[0] < 0 || fd[1] < 0)
+    error (SORT_FAILURE, errno, _("cmd fd read failed"));
 
   /* At least NMERGE + 1 subprocesses are needed.  More could be created, but
      uncontrolled subprocess generation can hurt performance significantly.
@@ -1040,49 +1092,85 @@ pipe_fork (int pipefds[2], size_t tries)
      previous merge finish (1 subprocess) in parallel with the current
      merge (NMERGE + 1 subprocesses).  */
 
-  if (nmerge + 1 < nprocs)
-    reap_some ();
+  //if (nmerge + 1 < nprocs)
+  //  reap_some ();
 
-  while (tries--)
+  pid = fork ();
+  switch (pid)
     {
-      /* This is so the child process won't delete our temp files
-         if it receives a signal before exec-ing.  */
-      cs = cs_enter ();
-      saved_temphead = temphead;
-      temphead = NULL;
-
-      pid = fork ();
-      saved_errno = errno;
-      if (pid)
-        temphead = saved_temphead;
-
-      cs_leave (cs);
-      errno = saved_errno;
-
-      if (0 <= pid || errno != EAGAIN)
+      default:
+        close (fd[0]);
+        close (fd[1]);
+        /** XXX: nprocs will not be incremented in the "main" thread */
+        ++nprocs;
+        write_or_die (fork_worker_test[1], &pid, sizeof(pid), "fail to reply");
         break;
-      else
-        {
-          xnanosleep (wait_retry);
-          wait_retry *= 2;
-          reap_exited ();
-        }
+      case -1:
+        write_or_die (fork_worker_test[1], &pid, sizeof(pid), "fail to reply");
+        break;
+      case 0:
+        move_fd_or_die (fd[0], STDIN_FILENO);
+        move_fd_or_die (fd[1], STDOUT_FILENO);
+        exec_or_die (compress_program, decompress);
+        async_safe_die (errno, "couldn't execute compress program");
+        break;
     }
+}
+static void
+fork_worker_loop (void)
+{
+  char type;
 
-  if (pid < 0)
+  while (1)
     {
-      saved_errno = errno;
+      read_or_die (fork_worker_add[0], &type, 1, "type");
+
+      if (type == FORK_WORKER_CREATE)
+        fork_worker_create();
+      else if (type == FORK_WORKER_REAP)
+        fork_worker_reap();
+      else if (type == FORK_WORKER_CLEANUP)
+        _exit(0);
+      else
+        error (SORT_FAILURE, errno, "illegal command: %c", type);
+    }
+}
+
+
+/* Fork a child process for piping to and do common cleanup.  The
+   TRIES parameter tells us how many times to try to fork before
+   giving up.  Return the PID of the child, or -1 (setting errno)
+   on failure. */
+
+static pid_t
+pipe_fork (int pipefds[2], int decompress)
+{
+#if HAVE_WORKING_FORK
+  struct tempnode *saved_temphead;
+  pid_t pid IF_LINT ( = -1);
+  struct cs_status cs;
+
+  /* This is so the child process won't delete our temp files
+     if it receives a signal before exec-ing.  */
+  cs = cs_enter ();
+  saved_temphead = temphead;
+  temphead = NULL;
+
+  write_or_die (fork_worker_add[1], &FORK_WORKER_CREATE, 1, "type");
+  write_or_die (fork_worker_add[1], &decompress, sizeof(decompress), "args");
+  sendfd (fork_worker_add[1], pipefds[0]);
+  sendfd (fork_worker_add[1], pipefds[1]);
+  read_or_die (fork_worker_test[0], &pid, sizeof(pid), "pid");
+  if (pid != -1)
+    temphead = saved_temphead;
+
+  cs_leave (cs);
+
+  if (pid == -1)
+    {
       close (pipefds[0]);
       close (pipefds[1]);
-      errno = saved_errno;
     }
-  else if (pid == 0)
-    {
-      close (STDIN_FILENO);
-      close (STDOUT_FILENO);
-    }
-  else
-    ++nprocs;
 
   return pid;
 
@@ -1094,14 +1182,13 @@ pipe_fork (int pipefds[2], size_t tries)
 /* Create a temporary file and, if asked for, start a compressor
    to that file.  Set *PFP to the file handle and return
    the address of the new temp node.  If the creation
-   fails, return NULL if the failure is due to file descriptor
-   exhaustion and SURVIVE_FD_EXHAUSTION; otherwise, die.  */
+   fails, die.  */
 
 static struct tempnode *
-maybe_create_temp (FILE **pfp, bool survive_fd_exhaustion)
+maybe_create_temp (FILE **pfp)
 {
   int tempfd;
-  struct tempnode *node = create_temp_file (&tempfd, survive_fd_exhaustion);
+  struct tempnode *node = create_temp_file (&tempfd);
   if (! node)
     return NULL;
 
@@ -1109,29 +1196,21 @@ maybe_create_temp (FILE **pfp, bool survive_fd_exhaustion)
 
   if (compress_program)
     {
-      int pipefds[2];
+      int pipefds[2], writefd;
+      if (pipe2 (pipefds, O_CLOEXEC) < 0)
+        return NULL;
 
-      node->pid = pipe_fork (pipefds, MAX_FORK_TRIES_COMPRESS);
-      if (0 < node->pid)
-        {
-          close (tempfd);
-          close (pipefds[0]);
-          tempfd = pipefds[1];
+      writefd = pipefds[1];
+      pipefds[1] = tempfd;
 
-          register_proc (node);
-        }
-      else if (node->pid == 0)
-        {
-          /* Being the child of a multithreaded program before exec(),
-             we're restricted to calling async-signal-safe routines here.  */
-          close (pipefds[1]);
-          move_fd_or_die (tempfd, STDOUT_FILENO);
-          move_fd_or_die (pipefds[0], STDIN_FILENO);
+      node->pid = pipe_fork (pipefds, 0);
 
-          execlp (compress_program, compress_program, (char *) NULL);
+      if (node->pid != -1)
+        register_proc (node);
 
-          async_safe_die (errno, "couldn't execute compress program");
-        }
+      close (pipefds[0]);
+      close (tempfd);
+      tempfd = writefd;
     }
 
   *pfp = fdopen (tempfd, "w");
@@ -1148,7 +1227,7 @@ maybe_create_temp (FILE **pfp, bool survive_fd_exhaustion)
 static struct tempnode *
 create_temp (FILE **pfp)
 {
-  return maybe_create_temp (pfp, false);
+  return maybe_create_temp (pfp);
 }
 
 /* Open a compressed temp file and start a decompression process through
@@ -1169,43 +1248,26 @@ open_temp (struct tempnode *temp)
   if (tempfd < 0)
     return NULL;
 
-  pid_t child = pipe_fork (pipefds, MAX_FORK_TRIES_DECOMPRESS);
+  if (pipe2 (pipefds, O_CLOEXEC) < 0)
+    return NULL;
 
-  switch (child)
+  int readfd = pipefds[0];
+  pipefds[0] = tempfd;
+
+  temp->pid = pipe_fork (pipefds, 1);
+
+  if (temp->pid != -1)
+    register_proc (temp);
+
+  close (tempfd);
+  close (pipefds[1]);
+
+  fp = fdopen (readfd, "r");
+  if (! fp)
     {
-    case -1:
-      if (errno != EMFILE)
-        error (SORT_FAILURE, errno, _("couldn't create process for %s -d"),
-               compress_program);
-      close (tempfd);
-      errno = EMFILE;
-      break;
-
-    case 0:
-      /* Being the child of a multithreaded program before exec(),
-         we're restricted to calling async-signal-safe routines here.  */
-      close (pipefds[0]);
-      move_fd_or_die (tempfd, STDIN_FILENO);
-      move_fd_or_die (pipefds[1], STDOUT_FILENO);
-
-      execlp (compress_program, compress_program, "-d", (char *) NULL);
-
-      async_safe_die (errno, "couldn't execute compress program (with -d)");
-
-    default:
-      temp->pid = child;
-      register_proc (temp);
-      close (tempfd);
-      close (pipefds[1]);
-
-      fp = fdopen (pipefds[0], "r");
-      if (! fp)
-        {
-          int saved_errno = errno;
-          close (pipefds[0]);
-          errno = saved_errno;
-        }
-      break;
+      int saved_errno = errno;
+      close (readfd);
+      errno = saved_errno;
     }
 
   return fp;
@@ -3856,7 +3918,7 @@ merge (struct sortfile *files, size_t ntemps, size_t nfiles,
         {
           nopened--;
           xfclose (fps[nopened], files[nopened].name);
-          temp = maybe_create_temp (&tfp, ! (nopened <= 2));
+          temp = maybe_create_temp (&tfp);
         }
       while (!temp);
 
@@ -4187,6 +4249,7 @@ main (int argc, char **argv)
   char *files_from = NULL;
   struct Tokens tok;
   char const *outfile = NULL;
+  pid_t worker_pid = -1;
 
   initialize_main (&argc, &argv);
   set_program_name (argv[0]);
@@ -4401,6 +4464,25 @@ main (int argc, char **argv)
           if (compress_program && !STREQ (compress_program, optarg))
             error (SORT_FAILURE, 0, _("multiple compress programs specified"));
           compress_program = optarg;
+          {
+            /** TODO: check for HAVE_SOCKERPAIR */
+            if (socketpair (AF_UNIX, SOCK_STREAM, 0, fork_worker_add) < 0)
+              error (SORT_FAILURE, 0, _("cannot socketpair"));
+            if (socketpair (AF_UNIX, SOCK_STREAM, 0, fork_worker_test) < 0)
+              error (SORT_FAILURE, 0, _("cannot socketpair"));
+
+            worker_pid = fork ();
+            switch (worker_pid)
+              {
+                case 0:
+                  fork_worker_loop ();
+                  break;
+                case -1:
+                  error (SORT_FAILURE, errno, _("cannot create fork worker"));
+                default:
+                  break;
+              }
+          }
           break;
 
         case DEBUG_PROGRAM_OPTION:
@@ -4744,6 +4826,12 @@ main (int argc, char **argv)
 
   if (have_read_stdin && fclose (stdin) == EOF)
     die (_("close failed"), "-");
+
+  if (worker_pid != -1)
+    {
+      fork_worker_cleanup ();
+      waitpid (worker_pid, NULL, 0);
+    }
 
   return EXIT_SUCCESS;
 }
